@@ -1,0 +1,212 @@
+//
+// Detect Logon info by Location
+//
+AADSignInEventsBeta
+//| where Country !="CA"
+| summarize NbSucces=countif(ErrorCode=="0"), NbFailure=countif(ErrorCode!="0"), Comptes=make_set(AccountUpn),Applications=make_set(Application) by Country,City
+
+//
+// Detect Brute Force Attack
+//
+DeviceLogonEvents
+| extend Account=strcat(AccountDomain, "\\", AccountName)
+| summarize 
+    Successful=countif(ActionType == "LogonSuccess"),
+    Failed = countif(ActionType == "LogonFailed"),
+    TentativesAccount=make_set_if(AccountName,ActionType == "LogonFailed"),
+    CountAccount=dcountif(AccountName,ActionType == "LogonFailed"),
+    TentativesMachine=make_set_if(RemoteDeviceName,ActionType == "LogonFailed"),
+    VictimMachine=make_set_if(DeviceName,ActionType == "LogonFailed")
+    by RemoteIP
+| top 10 by Failed //break here
+| join kind=rightsemi DeviceLogonEvents on RemoteIP
+| summarize countif(ActionType == "LogonFailed") by RemoteIP,bin(Timestamp,4h)
+| render timechart 
+
+
+//
+// Detect Forwarding Rule
+//
+CloudAppEvents
+| where Timestamp > ago(2h)
+| where Application == "Microsoft Exchange Online"
+| where ActionType contains "InboxRule"
+| project Timestamp,IPAddress,AccountDisplayName,RawEventData
+| project Timestamp,IPAddress,AccountDisplayName,Operation=RawEventData.Operation,Action=RawEventData.OperationProperties[0].Value,Prop=RawEventData.OperationProperties[8].Value,
+ClientString=RawEventData.ClientInfoString,MailBoxOwner=RawEventData.MailboxOwnerUPN
+| parse Prop with * '"RawValue":"SMTP"' * '"PropType":31,"Value":"' FWEmail '","' *
+| project Timestamp,IPAddress,AccountDisplayName,ClientString,MailBoxOwner,Operation,Action,FWEmail
+| join kind=leftouter (AADSignInEventsBeta 
+    | where isnotempty(DeviceName) 
+    | summarize by IPAddress,DeviceName,Country,State,City,Latitude,Longitude 
+    | extend DeviceName=strcat(tolower(DeviceName),".judo.dafauve.com")) on IPAddress
+| project-reorder DeviceName
+
+//
+// Create Detection Rule from previous query
+//
+
+//
+// Pivot sur User
+//
+// Recherche si echange de courriel entre victime et suspect qui contiendrait des PJ dangereuses
+let victim="";
+let suspectdomain = "";
+EmailEvents
+| where Timestamp > ago(2d)
+| where (SenderMailFromAddress == victim or RecipientEmailAddress == victim) and (SenderMailFromDomain == suspectdomain or RecipientEmailAddress endswith(suspectdomain))
+| join EmailAttachmentInfo on NetworkMessageId
+| where FileName has_any (".docm",".dotm",".xlm",".xlsm",".xltm",".xlam",".pptm",".potm") //list is not exhaustive
+| project Timestamp,SenderFromAddress,RecipientEmailAddress,Subject, FileName, FileType,EmailDirection,ThreatTypes
+
+
+// Recherche autre echange de courriel avec domain suspect
+let victim="";
+let suspectdomain = "";
+EmailEvents
+| where Timestamp > ago(2h)
+| where (SenderMailFromAddress == victim or RecipientEmailAddress == victim) and (SenderMailFromDomain == suspectdomain or RecipientEmailAddress endswith(suspectdomain))
+| project Timestamp,SenderFromAddress,RecipientEmailAddress,Subject, EmailDirection
+
+
+// Activités effectuées via MCAS
+let victim="";
+//let TimeofInterest= todatetime("11/04/2021 12:00:00");
+CloudAppEvents
+| where Timestamp > ago(6h)
+//| where Timestamp > datetime_add('minute',-5,TimeofInterest)
+| where AccountDisplayName contains victim
+| summarize make_set(ActionType) by Application,UserAgent
+
+// Investigation du courriel envoyé par MrMiyagi a 
+// Dans Compliance Center
+
+
+// Y-a-t-il des Alertes sur la machine identifiées plus haut 
+let victim="";
+//let TimeofInterest= todatetime("11/04/2021 12:00:00");
+AlertEvidence
+| where DeviceName == victim 
+| where Timestamp > ago(5h)
+| join kind=rightsemi AlertEvidence on AlertId
+| join kind=inner AlertInfo on AlertId
+| summarize EntityTypes=make_set(EntityType),Filenames=make_set(FileName),Cmd=make_set(ProcessCommandLine) by AlertId,Title
+
+//
+// --> Pivot sur Postes et ses alertes 
+//
+
+//
+// Optionnel- Y a-t-il eu une macro malicieuse: cherche process cmd ou powershell initié par word ou excel 
+//
+let victim="";
+let TimeofInterest= todatetime("11/04/2021 12:00:00");
+DeviceProcessEvents
+| where DeviceName == victim
+| where Timestamp > ago(3h)
+//| where Timestamp > datetime_add('minute',-5,TimeofInterest)
+| where InitiatingProcessParentFileName has_any ("winword","excel")
+| where InitiatingProcessFileName has_any ("cmd","powershell")
+| project Timestamp,DeviceName,AccountName,InitiatingProcessParentFileName,InitiatingProcessFileName,FileName,ProcessCommandLine,InitiatingProcessCommandLine
+| summarize NbCommand=count(),ParentCommand=make_set(InitiatingProcessCommandLine),ChildCommand=make_set(ProcessCommandLine) by DeviceName,AccountName,FileName,InitiatingProcessFileName,InitiatingProcessParentFileName
+//Execution/detect-anomalous-process-trees.md
+
+//
+// Get Process Tree for MTT_Demo - final.docm
+//
+let victim="";
+let TimeofInterest= todatetime("11/04/2021 12:00:00");
+let user = "";
+DeviceProcessEvents
+| where DeviceName == victim
+| where AccountName contains user
+| where Timestamp > ago(3h)
+//| where Timestamp > datetime_add('minute',-5,TimeofInterest)
+| where InitiatingProcessCommandLine contains ""
+| where ProcessCommandLine has_any ("cmd.exe","powershell.exe")
+| join kind=inner (DeviceProcessEvents) on $left.ProcessId == $right.InitiatingProcessId
+| project Timestamp,GrandParent=InitiatingProcessParentFileName,GrandParent_Id=InitiatingProcessParentId,Parent=InitiatingProcessFileName,Parent_Id=InitiatingProcessId,Parent_cmd=InitiatingProcessCommandLine,Proc=FileName,Proc_id=ProcessId,Proc_cmd=ProcessCommandLine,Enfant=FileName1,Enfant_Id=ProcessId1,Enfant_cmd=ProcessCommandLine1
+| project-reorder Timestamp,GrandParent,Parent,Proc,Enfant,Enfant_cmd
+| where Enfant_cmd !contains "edge" and Enfant_cmd !contains "Compattelrunner"
+
+
+//
+//Get All processes related to malicious script demo.ps1
+let victim="";
+let TimeofInterest= todatetime("11/04/2021 12:00:00");
+let user ="";
+let SuspPsh="";
+DeviceProcessEvents
+| where DeviceName == victim
+| where Timestamp > ago(5h)
+| where AccountName contains user
+//| where Timestamp > datetime_add('minute',-5,TimeofInterest)
+| where InitiatingProcessCommandLine contains SuspPsh
+| where ProcessCommandLine !contains "csc.exe"
+| summarize arg_min(Timestamp,ProcessCommandLine) by ProcessCommandLine
+| project Timestamp,ProcessCommandLine
+
+// Find who else got the Office file and if it was shared with other users
+let SuspPJ = "";
+DeviceFileEvents
+| where FileName == ""
+| where ActionType == "FileCreated"
+| project TimeFileCreated=Timestamp,FileName,SHA256
+| join kind=inner (EmailAttachmentInfo
+| extend TimeFileSent = Timestamp) on SHA256
+| project TimeFileSent,TimeFileCreated,FileName,SenderFromAddress,RecipientEmailAddress,ThreatTypes,SHA256
+| sort by TimeFileSent asc 
+//summarize results
+| summarize Firstseen=arg_min(TimeFileSent,*),make_set(RecipientEmailAddress) by SenderFromAddress,FileName,SHA256
+| project-away RecipientEmailAddress,ThreatTypes
+
+//
+// Add File indicator for SHA256
+//
+
+// detection des C2 
+DeviceNetworkEvents
+| where DeviceName contains ""
+| where Timestamp > ago(24h)
+| where InitiatingProcessCommandLine contains ""
+| where RemoteUrl !endswith "office.com" and RemoteUrl !endswith "microsoftonline.com" and RemoteUrl !endswith "microsoft.com" and RemoteUrl !endswith "azure.com"
+| summarize by RemoteUrl,RemoteIP,RemotePort,Protocol,InitiatingProcessParentFileName,InitiatingProcessCommandLine,InitiatingProcessFileName
+
+//
+// Add IP Indicator for C2
+//
+
+// Activités effectuées via AAD et AD
+let victim="";
+let TimeofInterest= todatetime("11/04/2021 12:00:00");
+IdentityLogonEvents
+//| where Timestamp > datetime_add('minute',-5,TimeofInterest)
+| where Timestamp > ago(5h)
+| where AccountName =~ victim
+| extend ResAD = TargetDeviceName
+| extend ResAAD = todynamic(AdditionalFields)
+| parse ResAAD with * 'CLOUD_SERVICE":"' RessourceAAD_temp '",' *
+| summarize RessourceAD=make_set(ResAD),RessourceAAD=make_set(RessourceAAD_temp) by Application,IPAddress
+
+// Activitees effectuées via AAD seulement
+let victim="";
+let TimeofInterest= todatetime("11/04/2021 12:00:00");
+AADSignInEventsBeta
+| where AccountUpn contains victim
+//| where Timestamp > datetime_add('minute',-5,TimeofInterest)
+| where Timestamp > ago(4h)
+| summarize count(),Ressource=make_set(ResourceDisplayName) by Application,IPAddress
+| where (Application !contains "Search") and (Application !contains "Bing") and Application !contains "Edge" and Application !contains "Loop"
+
+
+//Bonus: Detect script run from Azure Custom Script Extension 
+DeviceProcessEvents
+| where InitiatingProcessParentFileName == "RunCommandExtension.exe"
+| parse InitiatingProcessCommandLine with * "cmd" * "-File " Script
+| project-reorder Script
+| join kind=rightsemi (DeviceProcessEvents
+| where (InitiatingProcessFileName contains "powershell") and (InitiatingProcessCommandLine !contains "cmd") 
+| parse InitiatingProcessCommandLine with * "-File" Scripttemp
+| extend Script=trim_start(" ",Scripttemp)
+) on Script
+| project DeviceName,Timestamp,ProcessCommandLine,AccountName
