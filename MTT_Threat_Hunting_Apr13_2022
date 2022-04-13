@@ -1,0 +1,615 @@
+///////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////
+// KQL used in Microsoft Defender 365
+
+//
+// Optionnal: Detect Brute Force Attack based on Failed Device Logon events
+//
+DeviceLogonEvents
+| extend Account=strcat(AccountDomain, "\\", AccountName)
+| summarize 
+    Successful=countif(ActionType == "LogonSuccess"),
+    Failed = countif(ActionType == "LogonFailed"),
+    TentativesAccount=make_set_if(AccountName,ActionType == "LogonFailed"),
+    CountAccount=dcountif(AccountName,ActionType == "LogonFailed"),
+    TentativesMachine=make_set_if(RemoteDeviceName,ActionType == "LogonFailed"),
+    VictimMachine=make_set_if(DeviceName,ActionType == "LogonFailed")
+    by RemoteIP
+| top 10 by Failed //break here
+| join kind=rightsemi DeviceLogonEvents on RemoteIP
+| summarize FailedLogon=countif(ActionType == "LogonFailed") by RemoteIP,bin(Timestamp,4h)
+| render timechart 
+
+// Phishing:
+//detect for potential phishing by building a trustedsender list based on senderdomain prevalence and comparing with recent emails 
+// period of analysis
+let scanperiod = 4h;
+// min count of senderdomain to be considered trusted
+let threshold = 20; 
+let trustedperiod=timespan(30d);
+let trusteddomain=dynamic(["microsoft.com","contoso.com"]);
+let Trustedsender= EmailEvents
+| where Timestamp > ago(trustedperiod)
+| where EmailDirection == "Inbound" and DeliveryAction == "Delivered"
+| extend SecFlags=todynamic(AuthenticationDetails)
+| evaluate bag_unpack(SecFlags)
+| where CompAuth == "pass" and DKIM== "pass" and DMARC == "pass" and SPF == "pass"
+| summarize Count=count() by SenderFromDomain
+| where Count > threshold or SenderFromDomain has_any(trusteddomain);
+EmailEvents
+| where Timestamp > ago(scanperiod)
+| where EmailDirection == "Inbound" // and DeliveryAction == "Delivered"
+//| where isnotempty( ThreatTypes)
+| where UrlCount > 0 or AttachmentCount > 0
+| join kind=leftantisemi Trustedsender on SenderFromDomain
+| sort by Timestamp desc 
+| join kind=leftouter (EmailAttachmentInfo
+| where Timestamp > ago(scanperiod)
+| summarize Attachments=make_set(FileName) by NetworkMessageId
+) on NetworkMessageId 
+| join kind=leftouter (EmailUrlInfo
+| where Timestamp > ago(scanperiod)
+| summarize Urls=make_set(Url) by NetworkMessageId
+) on NetworkMessageId
+| project-away NetworkMessageId1,NetworkMessageId2
+
+
+// Go to Email Explorer
+
+// detect for web bug in emails by building a trustedsender list based on URLDomain prevalence and comparing with recent emails 
+let scanperiod = 4h;
+let LegitThreshold = 45; //define count of URLDomain required to be considered legit
+let webbugstrusteddomain = dynamic([".microsoft.com",".facebook.com","portal.azure.com",".linkedin.com",".office.com","aka.ms",".skype.com","portal.azure.com",".protection.outlook.com"]); //domains whitelisted from detection
+let LegitURL = EmailUrlInfo
+| where Timestamp > ago(30d) 
+| summarize Count=count() by UrlDomain
+| where Count >= LegitThreshold or UrlDomain has_any (webbugstrusteddomain);
+EmailUrlInfo
+| where Timestamp > ago(scanperiod)
+| join kind=leftanti LegitURL on UrlDomain
+| join kind=inner EmailEvents on NetworkMessageId
+| project-reorder Timestamp,Url,UrlDomain,SenderFromAddress,RecipientEmailAddress,Subject,AttachmentCount,UrlCount
+| sort by Timestamp desc 
+
+// detect for web bug or remote macro template in office documents by building a trustedsender list based on URLDomain prevalence and comparing with recent emails 
+// this will capture net connexion coming from the Office app too
+let scanperiod = 4h;
+let OfficeApps=dynamic(["winword.exe","excel.exe","powerpoint.exe"]);
+let LegitThreshold = 25; //define count of URLDomain required to be considered legit
+let Officebugstrusteddomain = dynamic([".microsoft.com",".office.com",".live.com",".office.net",".outlook.com",".msn.com","dafauve.sharepoint.com"]); //domains whitelisted from detection
+let LegitDomain = DeviceNetworkEvents
+| where Timestamp > ago(30d) 
+| where InitiatingProcessFileName has_any (OfficeApps)
+| where isnotempty(RemoteUrl)
+|summarize Count=count() by RemoteUrl
+| where Count >= LegitThreshold or RemoteUrl has_any (Officebugstrusteddomain);
+DeviceNetworkEvents
+| where Timestamp > ago(scanperiod)
+| where isnotempty( RemoteUrl)
+| where InitiatingProcessFileName has_any (OfficeApps)
+| join kind=leftantisemi LegitDomain on RemoteUrl
+| project-reorder Timestamp,RemoteUrl,InitiatingProcessCommandLine,InitiatingProcessFileName, InitiatingProcessAccountUpn, DeviceName
+| sort by Timestamp desc 
+
+
+//
+// Detect Macro template download. Check dotm file creation in InetCache following opening of an Office document 
+//
+let scanperiod=2h;
+let OfficeApps=dynamic(["winword.exe","excel.exe","powerpoint.exe"]);
+let OffFileExt=dynamic([".docx",".doc",".xlsx",".xls"]);
+let OfficeMacro=dynamic([".docm",".dotm",".xslm"]);
+DeviceFileEvents
+| where Timestamp > ago(scanperiod)
+| where DeviceName contains ""
+| where InitiatingProcessFileName has_any(OfficeApps) and InitiatingProcessCommandLine has_any (OffFileExt) and FileName has_any (OfficeMacro) and FolderPath contains "InetCache"
+| project-reorder DeviceName,InitiatingProcessAccountName,ActionType, FileName, FolderPath, InitiatingProcessCommandLine
+| sort by Timestamp desc 
+
+// look for .dotm SHA1 in the org directly from the results output -> file page
+
+//
+// --> Pivot on computer 
+//
+//
+//Was it a malicious macro: Check if powershell or cmd.exe initiated from word 
+//
+// Check child processes of suspicious Word document "MTT Demo.docx"
+let scanperiod=2h;
+let victim="";
+//let TimeofInterest= todatetime("11/04/2021 12:00:00");
+let lolbins = dynamic(["at.exe", "atbroker.exe", "bash.exe", "bitsadmin.exe", "certreq.exe", "certutil.exe", "cmd.exe", "cmdkey.exe", "cmstp.exe", "control.exe", "csc.exe", "cscript.exe", "desktopimgdownldr.exe", "dfsvc.exe", "diantz.exe", "diskshadow.exe", "dnscmd.exe", "esentutl.exe", "eventvwr.exe", "expand.exe", "extexport.exe", "extrac32.exe", "findstr.exe", "forfiles.exe", "ftp.exe", "gfxdownloadwrapper.exe", "gpscript.exe", "hh.exe", "ie4uinit.exe", "ieexec.exe", "ilasm.exe", "infdefaultinstall.exe", "installutil.exe", "jsc.exe", "makecab.exe", "mavinject.exe", "microsoft.workflow.compiler.exe", "mmc.exe", "mpcmdrun.exe", "msbuild.exe", "msconfig.exe", "msdt.exe", "mshta.exe", "msiexec.exe", "netsh.exe", "odbcconf.exe", "pcalua.exe", "pcwrun.exe", "pktmon.exe", "presentationhost.exe", "print.exe", "psr.exe", "rasautou.exe", "reg.exe", "regasm.exe", "regedit.exe", "regini.exe", "register-cimprovider.exe", "regsvcs.exe", "regsvr32.exe", "replace.exe", "rpcping.exe", "rundll32.exe", "runonce.exe", "runscripthelper.exe", "sc.exe", "schtasks.exe", "scriptrunner.exe", "syncappvpublishingserver.exe", "ttdinject.exe", "tttracer.exe", "vbc.exe", "verclsid.exe", "wab.exe", "wmic.exe", "wscript.exe", "wsreset.exe", "xwizard.exe", "agentexecutor.exe", "appvlp.exe", "bginfo.exe", "cdb.exe", "csi.exe", "devtoolslauncher.exe", "dnx.exe", "dotnet.exe", "dxcap.exe", "excel.exe", "mftrace.exe", "msdeploy.exe", "msxsl.exe", "ntdsutil.exe", "powerpnt.exe", "rcsi.exe", "sqldumper.exe", "sqlps.exe", "sqltoolsps.exe", "squirrel.exe", "te.exe", "tracker.exe", "vsjitdebugger.exe", "winword.exe", "wsl.exe","powershell.exe"]);
+//adding servics.exe and svchost.exe to the list of lolbins since these can be abused to start cmd.exe and talk to browsercore.
+let extendedLolbins = array_concat(lolbins, dynamic(["services.exe", "svchost.exe"]));
+DeviceProcessEvents
+| where DeviceName == victim
+| where Timestamp > ago(scanperiod)
+//| where InitiatingProcessFileName contains "word" or InitiatingProcessParentFileName contains "word" or InitiatingProcessCommandLine contains ".docx"
+| where InitiatingProcessCommandLine contains "MTT Demo" and FileName in (extendedLolbins)
+| project-reorder Timestamp,InitiatingProcessCommandLine,ProcessCommandLine,AccountUpn 
+// Get full process tree from this malicious document
+| join kind=inner (DeviceProcessEvents
+| where DeviceName == victim
+| where Timestamp > ago(scanperiod)
+) on $left.ProcessId == $right.InitiatingProcessId
+| where FileName1 !contains "sense"
+| project Timestamp,GrandParent=InitiatingProcessParentFileName,GrandParent_Id=InitiatingProcessParentId,Parent=InitiatingProcessFileName,Parent_Id=InitiatingProcessId,Parent_cmd=InitiatingProcessCommandLine,Proc=FileName,Proc_id=ProcessId,Proc_cmd=ProcessCommandLine,Child=FileName1,Child_Id=ProcessId1,Child_cmd=ProcessCommandLine1
+| project-reorder Timestamp,GrandParent,Parent_cmd,Proc_cmd,Child_cmd
+| where Child_cmd !contains "edge" and Child_cmd !contains "Compattelrunner"
+| sort by Timestamp desc 
+| summarize Commandlines=make_set(Child_cmd),Processes=make_set(Child) by Proc_cmd,Proc_id 
+
+
+
+// More details about malicious script. Get All network connexions
+let victim="";
+let scanperiod=1d;
+let user ="";
+let SuspPsh="demo.ps1";
+DeviceNetworkEvents
+| where DeviceName == victim
+| where Timestamp > ago(scanperiod)
+| where InitiatingProcessAccountName contains user
+| where InitiatingProcessCommandLine contains SuspPsh and InitiatingProcessParentFileName == "powershell.exe"
+| summarize IPs=make_set_if(RemoteIP,isempty(RemoteUrl)),RemoteURLs=make_set_if(RemoteUrl,isnotempty( RemoteUrl)) by InitiatingProcessCommandLine,InitiatingProcessId
+
+
+//
+// --> Pivot on user 
+//
+//
+// Detect PRT Abuse
+// Query from FalconForce: https://medium.com/falconforce/falconfriday-stealing-and-detecting-azure-prt-cookies-0xff18-96efce74ce63
+// 
+let victim="";
+let timeframe = 4h;
+let lolbins = dynamic(["at.exe", "atbroker.exe", "bash.exe", "bitsadmin.exe", "certreq.exe", "certutil.exe", "cmd.exe", "cmdkey.exe", "cmstp.exe", "control.exe", "csc.exe", "cscript.exe", "desktopimgdownldr.exe", "dfsvc.exe", "diantz.exe", "diskshadow.exe", "dnscmd.exe", "esentutl.exe", "eventvwr.exe", "expand.exe", "extexport.exe", "extrac32.exe", "findstr.exe", "forfiles.exe", "ftp.exe", "gfxdownloadwrapper.exe", "gpscript.exe", "hh.exe", "ie4uinit.exe", "ieexec.exe", "ilasm.exe", "infdefaultinstall.exe", "installutil.exe", "jsc.exe", "makecab.exe", "mavinject.exe", "microsoft.workflow.compiler.exe", "mmc.exe", "mpcmdrun.exe", "msbuild.exe", "msconfig.exe", "msdt.exe", "mshta.exe", "msiexec.exe", "netsh.exe", "odbcconf.exe", "pcalua.exe", "pcwrun.exe", "pktmon.exe", "presentationhost.exe", "print.exe", "psr.exe", "rasautou.exe", "reg.exe", "regasm.exe", "regedit.exe", "regini.exe", "register-cimprovider.exe", "regsvcs.exe", "regsvr32.exe", "replace.exe", "rpcping.exe", "rundll32.exe", "runonce.exe", "runscripthelper.exe", "sc.exe", "schtasks.exe", "scriptrunner.exe", "syncappvpublishingserver.exe", "ttdinject.exe", "tttracer.exe", "vbc.exe", "verclsid.exe", "wab.exe", "wmic.exe", "wscript.exe", "wsreset.exe", "xwizard.exe", "agentexecutor.exe", "appvlp.exe", "bginfo.exe", "cdb.exe", "csi.exe", "devtoolslauncher.exe", "dnx.exe", "dotnet.exe", "dxcap.exe", "excel.exe", "mftrace.exe", "msdeploy.exe", "msxsl.exe", "ntdsutil.exe", "powerpnt.exe", "rcsi.exe", "sqldumper.exe", "sqlps.exe", "sqltoolsps.exe", "squirrel.exe", "te.exe", "tracker.exe", "vsjitdebugger.exe", "winword.exe", "wsl.exe","powershell.exe"]);
+//adding servics.exe and svchost.exe to the list of lolbins since these can be abused to start cmd.exe and talk to browsercore.
+let extendedLolbins = array_concat(lolbins, dynamic(["services.exe", "svchost.exe"]));
+let trustedProcess = dynamic(["chrome.exe", "teams.exe"]);
+let trustedProcessHashes = DeviceProcessEvents | where FileName in~ (trustedProcess);
+let suspiciousHashes = trustedProcessHashes | distinct SHA1 | invoke FileProfile(SHA1, 1000) | where GlobalPrevalence < 200 or isempty(GlobalPrevalence);
+DeviceProcessEvents
+| where Timestamp >= ago(timeframe)
+| where ProcessVersionInfoOriginalFileName == "BrowserCore.exe"
+| join kind = leftouter (DeviceProcessEvents
+) on $left.InitiatingProcessParentId == $right.ProcessId, DeviceId, $left.InitiatingProcessParentFileName == $right.FileName
+// filter grandparent
+| where SHA11 in~ (suspiciousHashes) or InitiatingProcessParentFileName !in~ (trustedProcess)
+// filter parent
+| where InitiatingProcessSHA1 in~ (suspiciousHashes) or InitiatingProcessFileName !in~ (trustedProcess)
+| project-reorder Timestamp,DeviceName,AccountUpn,ProcessCommandLine,InitiatingProcessCommandLine,InitiatingProcessParentFileName
+// removing empty SHA11 hashes since sometimes the process start event is not logged and hence SHA11 is empty
+// this contaminates the results. A future improvement would be to check if the trusted process we're looking
+// for is logged as parent (instead of as child)
+//| where not(isempty(SHA11))
+//| invoke FileProfile(SHA11, 1000)
+//| where GlobalPrevalence < 200 or isempty(GlobalPrevalence) or InitiatingProcessParentFileName in~ (extendedLolbins)
+| where InitiatingProcessParentFileName in~ (extendedLolbins)
+| sort by Timestamp desc 
+
+
+
+// => Revoke all authentication artifacts and force pwrd reset (user page)
+
+
+
+/////////////////////////////////////////////////////
+/////////////////////////////////////////////////////
+// => view user actvities in MDfCA
+/////////////////////////////////////////////////////
+/////////////////////////////////////////////////////
+// MDfCA actvities
+let victim="";
+//let TimeofInterest= todatetime("11/04/2021 12:00:00");
+let scanperiod=2h;
+CloudAppEvents
+| where Timestamp > ago(scanperiod)
+//| where Timestamp > datetime_add('minute',-5,TimeofInterest)
+| where AccountDisplayName contains victim
+| summarize make_set(ActionType) by Application,UserAgent
+
+//
+// Detect Forwarding Rule
+//
+//let victim="";
+let scanperiod=2h;
+CloudAppEvents
+| where Timestamp > ago(scanperiod)
+//| where AccountDisplayName contains victim
+| where Application == "Microsoft Exchange Online"
+| project-reorder Timestamp,IPAddress,UserAgent
+| where ActionType contains "InboxRule"
+| project Timestamp,IPAddress,AccountDisplayName,RawEventData
+| project Timestamp,IPAddress,AccountDisplayName,Operation=RawEventData.Operation,Action=RawEventData.OperationProperties[0].Value,Prop=RawEventData.OperationProperties[8].Value,
+ClientString=RawEventData.ClientInfoString,MailBoxOwner=RawEventData.MailboxOwnerUPN
+| parse Prop with * '"RawValue":"SMTP"' * '"PropType":31,"Value":"' FWEmail '","' *
+| project Timestamp,IPAddress,AccountDisplayName,ClientString,MailBoxOwner,Operation,Action,FWEmail
+| join kind=leftouter (AADSignInEventsBeta 
+    | where isnotempty(DeviceName) 
+    | summarize by IPAddress,DeviceName,Country,State,City,Latitude,Longitude 
+    | extend DeviceName=strcat(tolower(DeviceName),".yourdomain.com")) on IPAddress
+| project-reorder DeviceName
+
+//
+// Detect OneDrive document sharing with MDfCA
+//
+let victim="";
+let scanperiod=2h;
+let SharedUsers= CloudAppEvents
+| where AccountDisplayName contains victim
+| where Timestamp > ago(scanperiod)
+| where Application contains "Onedrive"
+| where ActionType == "SharingSet"
+| extend SharedActivity=todynamic(ActivityObjects)
+| mv-expand SharedActivity
+| where SharedActivity.Type == "User"
+| project SharedUser=SharedActivity.Name,SharedUserId=SharedActivity.Id,ReportId;
+CloudAppEvents
+| where AccountDisplayName contains victim
+| where Timestamp > ago(scanperiod)
+| where Application contains "Onedrive"
+| where ActionType == "SharingSet"
+| extend SharedActivity=todynamic(ActivityObjects)
+| mv-expand SharedActivity
+| where SharedActivity.Type=="File"
+| project Timestamp, SharedFile=tostring(SharedActivity.Name),AccountDisplayName,AccountId,IPAddress,ReportId
+| join kind=innerunique SharedUsers on ReportId
+| summarize SharedUsers=make_set(SharedUser) by SharedFile,ReportId, AccountDisplayName,AccountId,IPAddress
+| project-away ReportId
+
+//
+// Detect Azure Activities with MDfCA
+//
+let victim="";
+let scanperiod=2h;
+CloudAppEvents
+| where AccountDisplayName contains victim
+| where Application == "Microsoft Azure"
+| summarize Operations=make_set(ActionType),ObjectIds=make_set(ObjectId) by ObjectName
+
+///////////////////////////////////////////////////
+///////////////////////////////////////////////////
+///////////////////////////////////////////////////
+
+
+// look for all emails sent between victim and suspicious domain. Insider attack?
+let victim="";
+let suspectdomain = "";
+let scanperiod=4h;
+EmailEvents
+| where Timestamp > ago(scanperiod)
+| where (SenderMailFromAddress == victim or RecipientEmailAddress == victim) and (SenderMailFromDomain == suspectdomain or RecipientEmailAddress endswith(suspectdomain))
+| project Timestamp,SenderFromAddress,RecipientEmailAddress,Subject, EmailDirection
+
+
+
+// Investigate email sent
+// in Compliance Center
+
+
+
+// Find who else got the Office file and if it was shared with other users
+//let SuspSHA256 = "";
+let SuspPJ = "MTT Demo.docx";
+let scanperiod=2h;
+DeviceFileEvents
+| where FileName contains SuspPJ
+| where ActionType == "FileCreated"
+| project TimeFileCreated=Timestamp,FileName,SHA256
+| summarize arg_max(TimeFileCreated,*)
+| join kind=rightsemi EmailAttachmentInfo on SHA256
+| where Timestamp > ago(scanperiod)
+| join kind=inner 
+(EmailEvents | where Timestamp > ago(scanperiod)) on NetworkMessageId
+| project Timestamp,SenderFromAddress,RecipientEmailAddress,FileName,Subject
+
+
+// ///////////////////////
+// Pivot to C2
+//////////////////////////
+
+
+//
+// detection of C2 from network connections done by Malicicous Script. Remove URLs of services used for Microsoft APIs
+let baseline=30d;
+let scanperiod=1d;
+let threshold=5;
+let LegitURL=dynamic(["office.com","microsoftonline.com","microsoft.com","azure.com"]);
+let maliciousfile="demo.ps1";
+let legitIP= DeviceNetworkEvents
+| where isempty(RemoteUrl) 
+| where RemoteIPType == "Public"
+| where Timestamp > ago(baseline)
+| summarize Count=count() by RemoteIP
+| where Count > threshold;
+DeviceNetworkEvents
+| where DeviceName contains ""
+| where Timestamp > ago(scanperiod)
+| where InitiatingProcessCommandLine contains maliciousfile
+| where RemoteUrl !endswith "office.com" and RemoteUrl !endswith "microsoftonline.com" and RemoteUrl !endswith "microsoft.com" and RemoteUrl !endswith "azure.com"
+| join kind=leftantisemi legitIP on RemoteIP
+| summarize by RemoteUrl,RemoteIP,RemotePort,Protocol,InitiatingProcessParentFileName,InitiatingProcessCommandLine,InitiatingProcessFileName
+
+//
+// Add IP Indicator for C2
+//
+
+
+///////// Other backdoor and suspicious connections
+
+// modification in AD
+IdentityDirectoryEvents
+| where Timestamp > ago(4h)
+| where ActionType in~ ("Service Principal created","Account Name changed","Group Membership Changed")
+
+
+// logon of SpyAdmin?
+let badaccount=""; // SpyAdmin SID 
+//let TimeofInterest= todatetime("11/04/2021 12:00:00");
+DeviceLogonEvents
+//| where Timestamp > datetime_add('minute',-5,TimeofInterest)
+| where Timestamp > ago(4h)
+| where AccountSid == badaccount or AccountName contains "SpyAdmin"
+| where LogonType contains "Interactive"
+| project-reorder RemoteIP
+
+//or
+
+let badaccount=""; // SpyAdmin SID 
+//let TimeofInterest= todatetime("11/04/2021 12:00:00");
+IdentityLogonEvents
+//| where Timestamp > datetime_add('minute',-5,TimeofInterest)
+| where Timestamp > ago(4h)
+| where AccountSid == badaccount or AccountName contains "SpyAdmin"
+
+
+
+// Another C2 to Add
+
+
+//
+//Bonus: Detect script run from Azure Custom Script Extension 
+//
+let scanperiod=1d; 
+DeviceProcessEvents
+| where Timestamp > ago(scanperiod)
+| where InitiatingProcessParentFileName == "RunCommandExtension.exe"
+| parse InitiatingProcessCommandLine with * "cmd" * "-File " Script
+| project-reorder Script
+| join kind=rightsemi (DeviceProcessEvents
+| where Timestamp > ago(scanperiod)
+| where (InitiatingProcessFileName contains "powershell") and (InitiatingProcessCommandLine !contains "cmd") 
+| parse InitiatingProcessCommandLine with * "-File" Scripttemp
+| extend Script=trim_start(" ",Scripttemp)
+) on Script
+| project DeviceName,Timestamp,ProcessCommandLine,AccountName
+
+
+///////////////////////////////////////////////////////
+//////////////////////////////////////////////////////
+////////////////////////
+// KQL Used in Sentinel
+
+
+// ==> Use Bookmarks on followings
+
+
+// detect for web bug or remote macro template in office documents by building a trustedsender list based on URLDomain prevalence and comparing with recent emails 
+// this will capture net connexion coming from the Office app too
+let scanperiod = 4h;
+let OfficeApps=dynamic(["winword.exe","excel.exe","powerpoint.exe"]);
+let LegitThreshold = 20; //define count of URLDomain required to be considered legit
+let Officebugstrusteddomain = dynamic([".microsoft.com",".office.com",".live.com",".office.net",".outlook.com",".msn.com"]); //domains whitelisted from detection
+let LegitDomain = DeviceNetworkEvents
+| where Timestamp > ago(30d) 
+| where InitiatingProcessFileName has_any (OfficeApps)
+| where isnotempty(RemoteUrl)
+|summarize Count=count() by RemoteUrl
+| where Count >= LegitThreshold or RemoteUrl has_any (Officebugstrusteddomain);
+DeviceNetworkEvents
+| where Timestamp > ago(scanperiod)
+| where isnotempty( RemoteUrl)
+| where InitiatingProcessFileName has_any (OfficeApps)
+| join kind=leftantisemi LegitDomain on RemoteUrl
+| project TimeGenerated,Timestamp,RemoteUrl,RemoteIP,InitiatingProcessCommandLine,InitiatingProcessFileName, InitiatingProcessAccountUpn, DeviceName
+| sort by Timestamp desc 
+| extend
+    AccountCustomEntity = InitiatingProcessAccountUpn,
+    IPCustomEntity = RemoteIP,
+    HostCustomEntity=DeviceName
+//-> bookmark
+
+
+//Was it a malicious macro: Check if powershell or cmd.exe initiated from word 
+//
+// Check child processes of suspicious Word document "MTT Demo.docx"
+let scanperiod=6h;
+let victim="";
+let lolbins = dynamic(["at.exe", "atbroker.exe", "bash.exe", "bitsadmin.exe", "certreq.exe", "certutil.exe", "cmd.exe", "cmdkey.exe", "cmstp.exe", "control.exe", "csc.exe", "cscript.exe", "desktopimgdownldr.exe", "dfsvc.exe", "diantz.exe", "diskshadow.exe", "dnscmd.exe", "esentutl.exe", "eventvwr.exe", "expand.exe", "extexport.exe", "extrac32.exe", "findstr.exe", "forfiles.exe", "ftp.exe", "gfxdownloadwrapper.exe", "gpscript.exe", "hh.exe", "ie4uinit.exe", "ieexec.exe", "ilasm.exe", "infdefaultinstall.exe", "installutil.exe", "jsc.exe", "makecab.exe", "mavinject.exe", "microsoft.workflow.compiler.exe", "mmc.exe", "mpcmdrun.exe", "msbuild.exe", "msconfig.exe", "msdt.exe", "mshta.exe", "msiexec.exe", "netsh.exe", "odbcconf.exe", "pcalua.exe", "pcwrun.exe", "pktmon.exe", "presentationhost.exe", "print.exe", "psr.exe", "rasautou.exe", "reg.exe", "regasm.exe", "regedit.exe", "regini.exe", "register-cimprovider.exe", "regsvcs.exe", "regsvr32.exe", "replace.exe", "rpcping.exe", "rundll32.exe", "runonce.exe", "runscripthelper.exe", "sc.exe", "schtasks.exe", "scriptrunner.exe", "syncappvpublishingserver.exe", "ttdinject.exe", "tttracer.exe", "vbc.exe", "verclsid.exe", "wab.exe", "wmic.exe", "wscript.exe", "wsreset.exe", "xwizard.exe", "agentexecutor.exe", "appvlp.exe", "bginfo.exe", "cdb.exe", "csi.exe", "devtoolslauncher.exe", "dnx.exe", "dotnet.exe", "dxcap.exe", "excel.exe", "mftrace.exe", "msdeploy.exe", "msxsl.exe", "ntdsutil.exe", "powerpnt.exe", "rcsi.exe", "sqldumper.exe", "sqlps.exe", "sqltoolsps.exe", "squirrel.exe", "te.exe", "tracker.exe", "vsjitdebugger.exe", "winword.exe", "wsl.exe","powershell.exe"]);
+//adding servics.exe and svchost.exe to the list of lolbins since these can be abused to start cmd.exe and talk to browsercore.
+let extendedLolbins = array_concat(lolbins, dynamic(["services.exe", "svchost.exe"]));
+DeviceProcessEvents
+| where DeviceName == victim
+| where TimeGenerated > ago(scanperiod)
+//| where InitiatingProcessFileName contains "word" or InitiatingProcessParentFileName contains "word" or InitiatingProcessCommandLine contains ".docx"
+| where InitiatingProcessCommandLine contains "MTT Demo.docx" and FileName in ( extendedLolbins)
+| project-reorder TimeGenerated,InitiatingProcessCommandLine,ProcessCommandLine,AccountUpn 
+// Get full process tree from this malicious document
+| join kind=inner (DeviceProcessEvents
+| where DeviceName == victim
+| where TimeGenerated > ago(scanperiod)
+) on $left.ProcessId == $right.InitiatingProcessId
+| where FileName1 !contains "sense"
+| project Timestamp,GrandParent=InitiatingProcessParentFileName,GrandParent_Id=InitiatingProcessParentId,Parent=InitiatingProcessFileName,Parent_Id=InitiatingProcessId,Parent_cmd=InitiatingProcessCommandLine,Proc=FileName,Proc_id=ProcessId,Proc_cmd=ProcessCommandLine,Child=FileName1,Child_Id=ProcessId1,Child_cmd=ProcessCommandLine1,AccountUpn,DeviceName
+| project-reorder Timestamp,GrandParent,Parent_cmd,Proc_cmd,Child_cmd
+| where Child_cmd !contains "edge" and Child_cmd !contains "Compattelrunner"
+| sort by Timestamp desc 
+| summarize Commandlines=make_set(Child_cmd),Processes=make_set(Child) by Proc_cmd,Proc_id,AccountUpn,DeviceName
+| extend
+    AccountCustomEntity = AccountUpn,
+    HostCustomEntity=DeviceName
+//->bookmark
+
+
+//
+// More details about malicious script demo.ps1. Get All child processes
+let victim="";
+let scanperiod=1d;
+let user ="";
+let SuspPsh="demo.ps1";
+DeviceProcessEvents
+| where DeviceName == victim
+| where TimeGenerated > ago(scanperiod)
+//| where AccountName contains user
+//| where Timestamp > datetime_add('minute',-5,TimeofInterest)
+| where InitiatingProcessCommandLine contains SuspPsh and InitiatingProcessParentFileName == "powershell.exe"
+| where ProcessCommandLine !contains "csc.exe"
+| summarize arg_max(TimeGenerated,ProcessCommandLine) by ProcessCommandLine,AccountUpn,DeviceName
+| project TimeGenerated,ProcessCommandLine,DeviceName,AccountUpn
+| extend
+    AccountCustomEntity = AccountUpn,
+    HostCustomEntity=DeviceName
+//-> bookmark
+
+
+// More details about malicious script. Get All network connexions
+let victim="";
+let scanperiod=4h;
+let user ="";
+let SuspPsh="demo.ps1";
+DeviceNetworkEvents
+| where DeviceName == victim
+| where TimeGenerated > ago(scanperiod)
+| where InitiatingProcessAccountName contains user
+//| where Timestamp > datetime_add('minute',-5,TimeofInterest)
+| where InitiatingProcessCommandLine contains SuspPsh and InitiatingProcessParentFileName == "powershell.exe"
+| summarize IPs=make_set_if(RemoteIP,isempty(RemoteUrl)),RemoteURLs=make_set_if(RemoteUrl,isnotempty( RemoteUrl)) by InitiatingProcessCommandLine,InitiatingProcessId
+
+
+
+// AAD Signins
+//
+// Add all APIs of interests below (Graph,Skype, Teams...)
+let APIs=dynamic(["Microsoft Graph","Windows Azure Service Management API","Office 365 Exchange Online"]);
+let victim="";
+let scanperiod=1d;  
+SigninLogs
+| where UserPrincipalName contains victim
+| where TimeGenerated > ago(scanperiod)
+| where ResultType == 0
+| where ResourceDisplayName in~ (APIs)
+| summarize Resources=make_set(ResourceDisplayName) by AppDisplayName,IPAddress,ClientAppUsed
+
+
+
+
+// Suspicious office Activities 
+let victim="";
+let scanperiod=8h;  
+OfficeActivity
+| where TimeGenerated > ago(scanperiod)
+//| where Timestamp > datetime_add('minute',-5,TimeofInterest)
+| where UserId contains victim
+| summarize make_set(Operation) by OfficeWorkload,RecordType,UserId
+
+
+// detect OneDrive Upload Activities
+let scanperiod=8h;  
+let victim="";
+OfficeActivity
+| where UserId contains victim
+| where TimeGenerated > ago(scanperiod)
+| where OfficeWorkload == "OneDrive"
+| where Operation == "FileSyncUploadedFull"
+| project TimeGenerated, UserId,SourceRelativeUrl,SourceFileName
+| extend
+    AccountCustomEntity=UserId
+//-> bookmark
+
+// detect OneDrive Sharing Activities
+let scanperiod=4h;  
+let victim="";
+OfficeActivity
+| where UserId contains victim
+| where TimeGenerated > ago(scanperiod)
+| where OfficeWorkload == "OneDrive"
+| where Operation == "SharingSet"
+| project TimeGenerated,SourceRelativeUrl,SourceFileName,TargetUserOrGroupName
+| extend
+    AccountCustomEntity=TargetUserOrGroupName
+//-> bookmark
+
+
+
+// Summarize Azure Activity for victim
+let victim="";
+let scanperiod=4h;  
+AzureActivity
+| where TimeGenerated > ago(scanperiod)
+| where Caller contains victim
+| project TimeGenerated,Caller,CallerIpAddress,ActivityStatusValue,ResourceProviderValue,OperationNameValue,Ressource=tostring(todynamic(Properties).resource),_ResourceId
+| summarize NbRessource=dcount(_ResourceId),Ressource=make_set(Ressource) by OperationNameValue,Caller,CallerIpAddress
+| extend
+    AccountCustomEntity = CallerIpAddress,
+    IPCustomEntity=CallerIpAddress
+//-> BookMark
+
+//-> skip - Analytic
+// Focus on VM Run Command, leverage SecurityEvents (Process Creation))
+// Process Command line details from VM Run Command
+let scanperiod=4h;
+SecurityEvent
+| where TimeGenerated > ago(scanperiod)
+| where EventID == 4688
+| where ParentProcessName contains "RunCommandExtension.exe"
+| extend RootId=NewProcessId
+| join kind=inner (SecurityEvent 
+| where TimeGenerated > ago(scanperiod)
+| where EventID == 4688
+| extend RootChild1=NewProcessId
+| where CommandLine contains "-File script" and ParentProcessName contains "cmd.exe") on Computer,$left.RootId==$right.ProcessId
+| join kind=inner (SecurityEvent 
+| where TimeGenerated > ago(scanperiod)
+| where EventID == 4688
+| extend RootChild2=NewProcessId 
+| where ParentProcessName contains "powershell.exe") on Computer,$left.RootChild1==$right.ProcessId
+| project Computer,TimeGenerated,cmd=CommandLine2,Account
+| extend 
+    HostCustomEntity=Computer
+//-> bookmark
+
+
+
+//
+// focus on NSG -> skip : Analytic
+let victim="";
+let scanperiod=13h;  
+AzureActivity
+| where TimeGenerated > ago(scanperiod)
+| where Caller contains victim
+| where OperationNameValue == "MICROSOFT.NETWORK/NETWORKSECURITYGROUPS/WRITE"
+| project TimeGenerated,Caller,CallerIpAddress,ActivityStatusValue,Resource=(todynamic(Properties).resource),Details=(todynamic(Properties).requestbody)
+| parse Details with * 'sourceAddressPrefix":"' RemoteIP '"' * 'access":"' Access '"' * 'destinationPortRange":"' AddedPort '"' *
+| extend AddedPort,RemoteIP,Access
+
+
+// focus on VM delete -> Hunting
+
+
+// Focus on Storage Accounts secrets -> Hunting
+
+
+// Logon with SpyAdmin -> skip: Analytic
+//
+//
+let scanperiod=1d;
+SecurityEvent
+| where TimeGenerated > ago(scanperiod)
+| where EventID == 4624
+| where AccountType == "User" and Account contains "SpyAdmin"
+| project TimeGenerated,LogonTypeName,Account,Computer,WorkstationName,SourceIP=IpAddress
+
+
+
